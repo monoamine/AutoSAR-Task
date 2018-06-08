@@ -2,21 +2,24 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
-#include <functional>
+//#include <functional>
 #include <iostream>
 #include <memory>
+#include <utility>
 #include <mutex>
-#include <fstream>
+//#include <fstream>
 #include <random>
 #include <set>
+#include <future>
 #include <string>
 #include <vector>
 #include <thread>
 #include <sstream>
-#include <type_traits>
+//#include <type_traits>
 #include <boost/crc.hpp>
 
-// the most used ones
+using namespace std::chrono_literals;
+
 using std::cout;
 using std::endl;
 using std::string;
@@ -25,6 +28,18 @@ using std::mutex;
 using std::atomic;
 using std::vector;
 using std::thread;
+using std::unique_ptr;
+using std::promise;
+using std::future;
+using std::make_unique;
+using std::unique_lock;
+using std::uniform_int_distribution;
+using std::random_device;
+using std::deque;
+using std::condition_variable;
+using std::once_flag;
+using std::call_once;
+using std::move;
 
 /* 
 TO DO:
@@ -38,50 +53,42 @@ TO DO:
 - finish crc32 calculating consumer functionality
 */
 
-namespace utils {
-class SpinMutex
+template <typename EngineT = std::default_random_engine>
+void fill_with_random_values(string& str, std::pair<char, char> range)
 {
-    std::atomic_flag flag_ = ATOMIC_FLAG_INIT;
-public:
-    SpinMutex() : flag_(ATOMIC_FLAG_INIT) {}
-    inline void lock() { while (flag_.test_and_set(std::memory_order_acquire)); }
-    inline void unlock() { flag_.clear(std::memory_order_release); }
-};
+    static random_device rdev;
+    static EngineT engine {};
+    engine.seed(rdev());
+    static uniform_int_distribution<char> uniform_distr(range.first, range.second);
 
-struct SafeCout : std::stringstream 
-{
-    mutex mtx;
-    ~SafeCout()
-    {
-        lock_guard<mutex> lck(mtx);
-        cout << rdbuf();
-        cout.flush();
-    }
-};
-} // namespace utils
-
-// TODO:
-// - make this a template class to add option for choosing underlying containers
-// - apply the policy-based design: e.g. choose lock types (mutex, spinlock, lock-free, etc.)
-// - use futures/packaged_tasks/async and exception handling
+    for (auto& element : str)
+        element = uniform_distr(engine);
+}
 
 class DataBlockProducer
 {
+    using str_vector_t = vector<string>;
+
     const size_t n_threads_;
     size_t n_blocks_;
     const size_t block_len_;
     
-    std::deque<vector<string>> queue_;
+    vector<vector<string>> queue_;
     vector<thread> A_;
     mutex q_sync_mtx_;
 
-    vector<string> blocks_bunch_;
-    atomic<int> n_done_;
-    utils::SpinMutex smtx_;
+    unique_ptr<str_vector_t> blocks_bunch_;
+    atomic<int> count_;
 
-    mutex mtx_;
-    std::condition_variable cv_;
-    bool flag_ = false;
+    once_flag once_f_;
+    mutex mtx_, mtx2_;
+    atomic<bool> flag_{false};
+    atomic<bool> done_{false};
+
+    unique_ptr<promise<void>> prom_ptr_;
+    future<void> fut_;
+
+    string dummy_str_;
 
     // Get the amount of data blocks to generate for the next iteration
     // Usually this will be equal to the generator threads number
@@ -89,57 +96,62 @@ class DataBlockProducer
     inline size_t next_job_size()
     {
         return (n_blocks_ <= n_threads_) ? n_blocks_ : n_threads_;
-    }
+    }    
 
 public:
     DataBlockProducer(const size_t& thread_number, const size_t& block_number, const size_t& block_size) : 
         n_threads_(thread_number), 
         n_blocks_(block_number),
-        block_len_(block_size)
+        block_len_(block_size),
+        prom_ptr_(make_unique<promise<void>>()),
+        fut_(prom_ptr_->get_future())
     {
-        auto sz = next_job_size();
-        blocks_bunch_.resize(sz);
-        n_done_ = sz;
+        count_ = next_job_size();
+        dummy_str_.assign(block_len_, ' ');
+        blocks_bunch_ = make_unique<str_vector_t>(count_, dummy_str_);
     }
 
     void worker(size_t id)
     {
-        string rand_data;
-        std::random_device rdev;
-        std::uniform_int_distribution<char> ch_distr(' ', 'z');
-        rand_data.reserve(block_len_);
-        
         // TODO: break when the needed amount of blocks is generated
-        for (;;)
+        for (;!done_.load();flag_.store(false))
         {   
             // TODO: move to a separate function
             // make more generic, add random engine like mt19937
-            // - use iterators and STL algorithms like std::accumulate
-            for (size_t i = 0; i < block_len_; ++i)
-                rand_data += ch_distr(rdev);
-            
-            blocks_bunch_[id] = rand_data;
+            auto& str = (*blocks_bunch_)[id];
 
-            int idx = n_done_.fetch_sub(1, std::memory_order_relaxed);
-            if (idx > 0)
+            fill_with_random_values(str, std::make_pair<char, char>(' ' + 1, 'z'));
+
+            if (--count_ > 0)
             {
-                std::unique_lock<mutex> lck(mtx_);
-                cv_.wait(lck, [this] { return flag_; });
+                while (!flag_.load())
+                    std::this_thread::sleep_for(5ms);
             }
             else
             {
-                for (size_t z = 0; z < blocks_bunch_.size(); ++z)
+                for (size_t z = 0; z < blocks_bunch_->size(); ++z)
                 {
-                    utils::SafeCout() << "\nBlock #" << (n_blocks_ - z) << "(thread #" << z << ")" << endl;
-                    utils::SafeCout() << "vec[" << z << "] = " << blocks_bunch_[z] << endl;
+                    cout << "\nBlock #" << (n_blocks_ - z) << "(thread #" << z << ")" << endl;
+                    cout << "vec[" << z << "] = " << (*blocks_bunch_)[z] << endl;
                 }
+                    
+                auto sz = (*blocks_bunch_).size();
+                if (sz >= n_blocks_)
+                {
+                    done_.store(true);
+                    break;
+                }
+                n_blocks_ -= (*blocks_bunch_).size();
+                queue_.emplace_back(move(*blocks_bunch_));
 
-                lock_guard<mutex> lck(mtx_);
-                n_blocks_ -= blocks_bunch_.size();
-                // TODO: std::move the contents of blocks_bunch_ to the queue_
-                cv_.notify_all();
+                count_.store(next_job_size(), std::memory_order::memory_order_release);
+                blocks_bunch_ = make_unique<str_vector_t>();
+                blocks_bunch_->assign(count_, dummy_str_);
             }
+            flag_.store(true);
         }
+
+        call_once(once_f_, [this] { prom_ptr_->set_value(); });
     }
 
     void run()
@@ -147,6 +159,10 @@ public:
         // TODO: replace with futures and detach
         for (size_t i = 0; i < n_threads_; ++i) 
             A_.emplace_back(&DataBlockProducer::worker, this, i);
+        
+        fut_.get();
+        if (!fut_.valid())
+            cout << "\nLOOOL\n";
         
         for_each(A_.begin(), A_.end(), [](thread& t) { if (t.joinable()) t.join(); });
     }
@@ -157,13 +173,13 @@ public:
 // Need to completely rewrite the class (except get_crc32 method and usage of std::set to detect computation error)
 class CRC32Calculator
 {
-    const size_t n_threads_;
+    //const size_t n_threads_;
 
     vector<thread> B_;
     std::set<decltype(boost::crc_32_type().checksum())> check_set_ {};
     
 public:
-    CRC32Calculator(const size_t& Bthread_number) : n_threads_(Bthread_number) {}
+    CRC32Calculator(const size_t& Bthread_number) {} //: n_threads_(Bthread_number) {}
 
     decltype(auto) get_crc32(const string& my_string)
     {
@@ -212,7 +228,7 @@ public:
 
 int main(int argc, char* argv[])
 {
-    DataBlockProducer prod(5, 35, 10);
+    DataBlockProducer prod(3, 9, 10);
     prod.run();
 
     return 0;
